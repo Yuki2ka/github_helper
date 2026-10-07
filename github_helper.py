@@ -37,6 +37,9 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
+# Do not leave bytecode caches in the portable application folder.
+sys.dont_write_bytecode = True
+
 # cryptography and tkinterdnd2 are imported only after
 # bootstrap_dependencies() has run.
 
@@ -98,7 +101,7 @@ def install_packages(packages):
 
     result = subprocess.run(
         [sys.executable, "-m", "pip", "install", "--upgrade",
-         "--target", str(LIBS_DIR)] + list(packages),
+         "--no-compile", "--target", str(LIBS_DIR)] + list(packages),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -1312,6 +1315,137 @@ print(response.decode("utf-8"), end="")
     # Git commands
     # --------------------------------------------------------
 
+    def token_is_configured(self):
+        """Whether the app has a token it could use after an auth failure."""
+        if self.session_token:
+            return True
+
+        try:
+            if TOKEN_TEXT_FILE.is_file() and TOKEN_TEXT_FILE.read_text(
+                encoding="utf-8"
+            ).strip():
+                return True
+        except (OSError, UnicodeError):
+            pass
+
+        return TOKEN_ENCRYPTED_FILE.is_file()
+
+    @staticmethod
+    def git_requested_credentials(output):
+        """Recognize common HTTPS authentication failures, not SSH key errors."""
+        text = output.lower()
+
+        if "permission denied (publickey" in text:
+            return False
+
+        markers = (
+            "authentication failed",
+            "failed to authenticate",
+            "could not read username",
+            "could not read password",
+            "terminal prompts disabled",
+            "invalid username or password",
+            "not authorized",
+            "access denied",
+            "write access to repository not granted",
+            "support for password authentication was removed",
+            "requested url returned error: 401",
+            "requested url returned error: 403",
+            "repository not found",
+        )
+        return any(marker in text for marker in markers)
+
+    def clone_target_for_retry(self, args, cwd):
+        """Return an originally empty clone destination safe to reset."""
+        if len(args) < 3 or args[0] != "clone":
+            return None, False
+
+        target = Path(args[-1])
+
+        if not target.is_absolute() and cwd:
+            target = Path(cwd) / target
+
+        if target.is_symlink():
+            return None, False
+
+        if not target.exists():
+            return target, False
+
+        if not target.is_dir():
+            return None, False
+
+        try:
+            if any(target.iterdir()):
+                return None, False
+        except OSError:
+            return None, False
+
+        return target, True
+
+    def clear_failed_clone(self, target, restore_empty_directory):
+        """Remove only artifacts from a clone started in an empty path."""
+        if target is None or not target.exists() or target.is_symlink():
+            return
+
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+
+            if restore_empty_directory:
+                target.mkdir(parents=True, exist_ok=True)
+
+            self.write_log(
+                "Removed the incomplete unauthenticated clone; "
+                "the folder is ready to retry.",
+                "info"
+            )
+        except OSError as error:
+            self.write_log(
+                f"Could not clean the incomplete clone: {error}",
+                "warning"
+            )
+
+    def _run_git_command(self, command, cwd, env):
+        """Run Git once, returning (exit code, combined output)."""
+        self.write_log(
+            f"$ {' '.join(command)}",
+            "command"
+        )
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+
+            output = []
+
+            for line in process.stdout:
+                output.append(line)
+                self.write_log(line.rstrip(), "info")
+
+            return process.wait(), "".join(output)
+
+        except FileNotFoundError:
+            self.write_log(
+                "Git executable was not found.",
+                "error"
+            )
+            return None, ""
+
+        except Exception as error:
+            self.write_log(str(error), "error")
+            return None, ""
+
     def run_git(self, args, cwd=None, use_token=False):
         git_path = find_git()
 
@@ -1328,137 +1462,138 @@ print(response.decode("utf-8"), end="")
             )
             return False
 
-        helper_dir = None
-        stop_event = None
-        auth_thread = None
-
+        # Try network operations anonymously first. Public repositories,
+        # SSH keys, and local Git operations should not unlock t.bin.
         env = os.environ.copy()
-
-        # This only prevents Git from opening a terminal prompt.
-        # It does not contain the token.
         env["GIT_TERMINAL_PROMPT"] = "0"
-
-        if use_token:
-            token = self.get_token()
-
-            if not token:
-                return False
-
-            server_ready = threading.Event()
-            stop_event = threading.Event()
-            server_info = {}
-
-            auth_thread = threading.Thread(
-                target=self.askpass_server,
-                args=(
-                    token,
-                    server_ready,
-                    server_info,
-                    stop_event
-                ),
-                daemon=True
-            )
-
-            auth_thread.start()
-            server_ready.wait(timeout=5)
-
-            if "port" not in server_info:
-                self.write_log(
-                    "Could not start authentication service.",
-                    "error"
-                )
-                return False
-
-            helper_dir, helper_path = (
-                self.create_askpass_helper()
-            )
-
-            env["GIT_ASKPASS"] = str(helper_path)
-
-            # These contain only the local socket details.
-            # They do not contain the token.
-            env["GIT_GUI_ASKPASS_PORT"] = str(
-                server_info["port"]
-            )
-
-            env["GIT_GUI_ASKPASS_CHALLENGE"] = (
-                server_info["challenge"]
-            )
 
         command = [git_path]
 
         if use_token:
-            # Credential helpers run BEFORE GIT_ASKPASS and would read
-            # or store the token in the OS credential store.
-            # An empty value disables every configured helper.
+            # Keep this app's token out of configured OS credential helpers.
+            # The empty value also makes the first, anonymous attempt prompt-free.
             command += ["-c", "credential.helper="]
+            env.pop("GIT_ASKPASS", None)
 
         command += args
-
-        self.write_log(
-            f"$ {' '.join(command)}",
-            "command"
+        clone_target, restore_clone_directory = (
+            self.clone_target_for_retry(args, cwd) if use_token
+            else (None, False)
         )
 
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace"
-            )
+        result, output = self._run_git_command(command, cwd, env)
 
-            for line in process.stdout:
-                self.write_log(
-                    line.rstrip(),
-                    "info"
-                )
+        if result is None:
+            return False
 
-            result = process.wait()
+        if result == 0:
+            self.write_log("Command completed successfully.", "success")
+            return True
 
-            if result == 0:
-                self.write_log(
-                    "Command completed successfully.",
-                    "success"
-                )
-                return True
-
+        if not use_token or not self.git_requested_credentials(output):
             self.write_log(
                 f"Command failed with exit code {result}.",
                 "error"
             )
             return False
 
-        except FileNotFoundError:
+        # If clone failed before authentication, remove only a partial clone
+        # created in a destination that was empty when this operation began.
+        self.clear_failed_clone(clone_target, restore_clone_directory)
+
+        if not self.token_is_configured():
             self.write_log(
-                "Git executable was not found.",
+                "The remote requested credentials, but no app token is "
+                "configured. Public repositories and SSH keys work without "
+                "t.txt/t.bin; for a private HTTPS repository, add a token "
+                "before retrying.",
+                "warning"
+            )
+            self.write_log(
+                f"Command failed with exit code {result}.",
+                "error"
+            )
+            return False
+
+        self.write_log(
+            "The remote requires credentials. Unlocking the configured "
+            "token and retrying.",
+            "warning"
+        )
+
+        token = self.get_token()
+
+        if not token:
+            self.write_log(
+                "No token was unlocked; command was not retried.",
+                "warning"
+            )
+            return False
+
+        server_ready = threading.Event()
+        stop_event = threading.Event()
+        server_info = {}
+        auth_thread = threading.Thread(
+            target=self.askpass_server,
+            args=(token, server_ready, server_info, stop_event),
+            daemon=True
+        )
+        helper_dir = None
+
+        try:
+            auth_thread.start()
+
+            if not server_ready.wait(timeout=5) or "port" not in server_info:
+                self.write_log(
+                    "Could not start authentication service.",
+                    "error"
+                )
+                return False
+
+            helper_dir, helper_path = self.create_askpass_helper()
+            token_env = env.copy()
+            token_env["GIT_ASKPASS"] = str(helper_path)
+
+            # These contain only local socket details, never the token.
+            token_env["GIT_GUI_ASKPASS_PORT"] = str(server_info["port"])
+            token_env["GIT_GUI_ASKPASS_CHALLENGE"] = (
+                server_info["challenge"]
+            )
+
+            retry_result, _ = self._run_git_command(
+                command,
+                cwd,
+                token_env
+            )
+
+            if retry_result is None:
+                return False
+
+            if retry_result == 0:
+                self.write_log("Command completed successfully.", "success")
+                return True
+
+            self.write_log(
+                f"Command failed with exit code {retry_result}.",
                 "error"
             )
             return False
 
         except Exception as error:
             self.write_log(
-                str(error),
+                f"Authenticated Git retry failed: {error}",
                 "error"
             )
             return False
 
         finally:
-            if stop_event:
-                stop_event.set()
+            stop_event.set()
 
-            if auth_thread:
+            if auth_thread.is_alive():
                 auth_thread.join(timeout=3)
 
             if helper_dir and helper_dir.exists():
-                shutil.rmtree(
-                    helper_dir,
-                    ignore_errors=True
-                )
+                shutil.rmtree(helper_dir, ignore_errors=True)
 
     def get_folder(self):
         folder = self.folder_entry.get().strip()

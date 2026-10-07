@@ -218,3 +218,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local credentials and authenticator secrets (never commit)
+t.txt
+t.bin
+secret.bin
+secret.bin.tmp
+
+# Runtime downloads and dependency installs
+libs/
+portable-git/
+PortableGit-download.exe

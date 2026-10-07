@@ -1,0 +1,51 @@
+
+py tk script
+buttons clone, commit, push
+
+
+t.txt or .bin   access token if present
+**folder**  working dir (need to commit to git or apply patch)
+.url    address
+
+
+
+autodetect folder start (1st with .url companion), choose folder to operate
+input field for url addr
+working dir is not CWD where script but 1st child dir with .url companion or 1st child dir
+pygit\folder1\ ... data ...
+pygit\folder1.url
+pygit\github_helper.py
+
+colorful log
+ensure it is portable and not store token in os, so i can run it from sd card
+
+
+add button encrypt - create t.bin
+ask password
+ask user if want delete t
+password type once per session
+
+download portable git if need, according to os
+download all need pip lib if need at start
+
+
+
+add variable at start of script and input field
+name = "user1"
+
+
+add ability apply patch. it easy - make drop .patch to whole window
+git apply ...
+if drop difficult in py (on some platforms) - use also open button
+
+
+do not create __pycache__
+
+not all operations need token  - so dont false ask for t.bin
+
+## make '2FA_helper.py'
+
+user paste 32bit secret from github
+script encrypt it with password and save to secret.bin
+if bin present it  decrypt it using hardcoded const at start of file or fallback to ask password
+	then print generated pas key and have button to copy it to clipboard
