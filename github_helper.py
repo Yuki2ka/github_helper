@@ -1470,6 +1470,28 @@ print(response.decode("utf-8"), end="")
 
         return result.returncode == 0 and not result.stdout.strip()
 
+    def git_output(self, args, cwd=None):
+        """Run a read-only git command and return its stdout."""
+        git_path = find_git()
+
+        if not git_path:
+            return ""
+
+        try:
+            result = subprocess.run(
+                [git_path] + args,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+            return result.stdout
+
+        except Exception:
+            return ""
+
     def clone_repository(self):
         url = self.url_entry.get().strip()
 
@@ -1492,34 +1514,171 @@ print(response.decode("utf-8"), end="")
             if not proceed:
                 return
 
-        repository_name = url.rstrip("/").split("/")[-1]
+        folder = self.folder_entry.get().strip()
 
-        if repository_name.endswith(".git"):
-            repository_name = repository_name[:-4]
-
-        # Clone as a sibling folder of the script, matching the
-        # autodetection layout: pygit/repo/ + pygit/repo.url
-        destination = APP_DIR / repository_name
-
-        if destination.exists():
-            messagebox.showerror(
-                "Destination exists",
-                f"This folder already exists:\n{destination}"
+        if not folder:
+            messagebox.showwarning(
+                "Folder missing",
+                "Choose a folder. The repository will be cloned "
+                "directly into it, without a subfolder."
             )
             return
 
-        success = self.run_git(
-            ["clone", url, str(destination)],
-            cwd=str(APP_DIR),
+        folder_path = Path(folder)
+
+        if not folder_path.exists():
+            create = messagebox.askyesno(
+                "Folder does not exist",
+                "The folder does not exist:\n\n"
+                f"{folder}\n\n"
+                "Create it and clone into it?"
+            )
+
+            if not create:
+                return
+
+            try:
+                folder_path.mkdir(parents=True)
+            except OSError as error:
+                messagebox.showerror(
+                    "Could not create folder",
+                    str(error)
+                )
+                return
+
+        if not folder_path.is_dir():
+            messagebox.showerror(
+                "Not a folder",
+                f"This is not a folder:\n{folder}"
+            )
+            return
+
+        if (folder_path / ".git").exists():
+            messagebox.showinfo(
+                "Already a repository",
+                "The selected folder already contains a "
+                "repository.\n\nUse Commit and Push, or choose "
+                "another folder."
+            )
+            return
+
+        if not any(folder_path.iterdir()):
+            success = self.run_git(
+                ["clone", url, folder],
+                cwd=str(APP_DIR),
+                use_token=True
+            )
+
+            if success:
+                self.write_url_file(folder_path, url)
+                self.set_folder(
+                    folder,
+                    f"Repository cloned into: {folder}"
+                )
+            return
+
+        connect = messagebox.askyesno(
+            "Folder is not empty",
+            "Git cannot clone into a folder that already "
+            "contains files.\n\n"
+            "Connect the existing files to the repository?\n\n"
+            "This runs: init, remote add, fetch, checkout.\n"
+            "Your files are kept; repository files with the same "
+            "name are not overwritten."
+        )
+
+        if not connect:
+            return
+
+        self.connect_folder_to_repository(folder, url)
+
+    def connect_folder_to_repository(self, folder, url):
+        """
+        Connect a non-empty folder to a repository:
+        git init, add remote, fetch, track the default branch.
+        """
+        self.write_log(
+            "Connecting existing folder to repository...",
+            "info"
+        )
+
+        if not self.run_git(["init"], cwd=folder):
+            return
+
+        if not self.run_git(
+            ["remote", "add", "origin", url],
+            cwd=folder
+        ):
+            return
+
+        if not self.run_git(
+            ["fetch", "origin"],
+            cwd=folder,
+            use_token=True
+        ):
+            return
+
+        self.run_git(
+            ["remote", "set-head", "origin", "--auto"],
+            cwd=folder,
             use_token=True
         )
 
-        if success:
-            self.write_url_file(destination, url)
-            self.set_folder(
-                str(destination),
-                f"Switched to cloned repository: {destination}"
+        remote_branches = self.git_output(
+            ["branch", "-r"],
+            cwd=folder
+        )
+
+        if not remote_branches.strip():
+            self.write_log(
+                "Repository has no branches yet (empty "
+                "repository). Folder is connected; Commit and "
+                "Push will create the first branch.",
+                "warning"
             )
+            return
+
+        branch = None
+
+        for line in remote_branches.splitlines():
+            if "origin/HEAD" in line and "->" in line:
+                branch = line.split("->")[-1].strip()
+                branch = branch.split("/", 1)[-1]
+                break
+
+        if not branch:
+            for candidate in ("main", "master"):
+                if f"origin/{candidate}" in remote_branches:
+                    branch = candidate
+                    break
+
+        if not branch:
+            self.write_log(
+                "Fetched, but the default branch was not "
+                "detected. Checkout manually, for example:\n"
+                "git checkout --track origin/main",
+                "warning"
+            )
+            return
+
+        if not self.run_git(
+            ["checkout", "--track", f"origin/{branch}"],
+            cwd=folder
+        ):
+            self.write_log(
+                "Checkout stopped: local files with the same "
+                "name as repository files were not "
+                "overwritten. Move them away, or run "
+                "'git checkout -f' to overwrite.",
+                "warning"
+            )
+            return
+
+        self.write_url_file(Path(folder), url)
+        self.write_log(
+            f"Connected. Tracking origin/{branch}.",
+            "success"
+        )
 
     def commit_changes(self):
         folder = self.get_folder()
@@ -1594,8 +1753,20 @@ print(response.decode("utf-8"), end="")
             )
             return
 
+        # A folder that was connected (not cloned) has no upstream
+        # on the first push; -u origin HEAD creates it.
+        has_upstream = self.git_output(
+            ["rev-parse", "--abbrev-ref", "@{u}"],
+            cwd=folder
+        ).strip()
+
+        push_args = ["push"]
+
+        if not has_upstream:
+            push_args = ["push", "-u", "origin", "HEAD"]
+
         self.run_git(
-            ["push"],
+            push_args,
             cwd=folder,
             use_token=True
         )
