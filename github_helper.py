@@ -11,7 +11,7 @@ pygit/
   libs/               pip packages (auto-installed, portable)
   portable-git/       portable Git (auto-downloaded on Windows)
 
-Buttons: clone, commit, push, apply patch, encrypt token.
+Buttons: clone, fetch, commit, push, apply patch, encrypt token.
 A .patch/.diff file can be dropped anywhere in the window.
 '''
 
@@ -537,6 +537,16 @@ class GitGUI:
             bg="#0984e3",
             fg="white",
             activebackground="#74b9ff",
+            width=12
+        ).pack(side=tk.LEFT, padx=3)
+
+        tk.Button(
+            button_frame,
+            text="Fetch",
+            command=self.fetch_repository,
+            bg="#00cec9",
+            fg="white",
+            activebackground="#81ecec",
             width=12
         ).pack(side=tk.LEFT, padx=3)
 
@@ -1678,6 +1688,27 @@ print(response.decode("utf-8"), end="")
         self.write_log(
             f"Connected. Tracking origin/{branch}.",
             "success"
+        )
+
+    def fetch_repository(self):
+        folder = self.get_folder()
+
+        if not folder:
+            return
+
+        if not os.path.isdir(
+            os.path.join(folder, ".git")
+        ):
+            messagebox.showerror(
+                "Not a Git repo",
+                "The selected folder is not a Git repository."
+            )
+            return
+
+        self.run_git(
+            ["fetch", "origin"],
+            cwd=folder,
+            use_token=True
         )
 
     def commit_changes(self):
