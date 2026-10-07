@@ -11,7 +11,8 @@ pygit/
   libs/               pip packages (auto-installed, portable)
   portable-git/       portable Git (auto-downloaded on Windows)
 
-Buttons: clone, fetch, commit, push, apply patch, encrypt token.
+Buttons: clone, fetch, commit, push, apply patch, make HEAD main,
+encrypt token.
 A .patch/.diff file can be dropped anywhere in the window.
 '''
 
@@ -48,6 +49,10 @@ from tkinter.scrolledtext import ScrolledText
 # so nothing is ever written to Git config files.
 GIT_NAME = "user1"
 GIT_EMAIL = "user1@users.noreply.github.com"
+
+# Branch names used by the "Make HEAD main" button.
+MAIN_BRANCH = "main"
+OLD_BRANCH = "old"
 
 # ------------------------------------------------------------
 # Paths and constants
@@ -528,7 +533,7 @@ class GitGUI:
         self.email_entry.pack(fill=tk.X)
 
         button_frame = ttk.Frame(main)
-        button_frame.pack(fill=tk.X, pady=(0, 12))
+        button_frame.pack(fill=tk.X, pady=(0, 6))
 
         tk.Button(
             button_frame,
@@ -590,14 +595,27 @@ class GitGUI:
             width=12
         ).pack(side=tk.LEFT, padx=3)
 
+        branch_frame = ttk.Frame(main)
+        branch_frame.pack(fill=tk.X, pady=(0, 12))
+
+        tk.Button(
+            branch_frame,
+            text="Make HEAD main",
+            command=self.make_head_main,
+            bg="#e84393",
+            fg="white",
+            activebackground="#fd79a8",
+            width=16
+        ).pack(side=tk.LEFT, padx=3)
+
         ttk.Button(
-            button_frame,
+            branch_frame,
             text="Reset Token",
             command=self.reset_token
         ).pack(side=tk.RIGHT, padx=3)
 
         ttk.Button(
-            button_frame,
+            branch_frame,
             text="Clear Log",
             command=self.clear_log
         ).pack(side=tk.RIGHT, padx=3)
@@ -1480,27 +1498,82 @@ print(response.decode("utf-8"), end="")
 
         return result.returncode == 0 and not result.stdout.strip()
 
-    def git_output(self, args, cwd=None):
-        """Run a read-only git command and return its stdout."""
+    def git_run(self, args, cwd=None, log_errors=True):
+        """
+        Run a read-only git command.
+
+        Returns (success, stdout). Prefer this over git_output
+        when the difference between "failed" and "empty output"
+        matters, for example rev-parse --abbrev-ref @{u} on a
+        branch that has no upstream yet.
+        """
         git_path = find_git()
 
         if not git_path:
-            return ""
+            git_path = ensure_git(
+                self.root,
+                self.write_log
+            )
+
+        if not git_path:
+            self.write_log(
+                "Git is not available. Command aborted.",
+                "error"
+            )
+            return False, ""
 
         try:
             result = subprocess.run(
                 [git_path] + args,
                 cwd=cwd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace"
             )
-            return result.stdout
+        except Exception as error:
+            if log_errors:
+                self.write_log(str(error), "error")
 
-        except Exception:
-            return ""
+            return False, ""
+
+        if result.returncode != 0 and log_errors:
+            detail = (
+                result.stderr.strip() or result.stdout.strip()
+            )
+
+            self.write_log(
+                f"git {' '.join(args)} failed: {detail}",
+                "error"
+            )
+
+        return result.returncode == 0, result.stdout
+
+    def git_output(self, args, cwd=None):
+        """
+        Run a read-only git command and return its stdout.
+
+        Stays silent on failure, for queries whose failure is a
+        normal answer, such as "branch has no upstream".
+        """
+        return self.git_run(args, cwd=cwd, log_errors=False)[1]
+
+    def require_repository(self):
+        """Working folder when it is a Git repository, else None."""
+        folder = self.get_folder()
+
+        if not folder:
+            return None
+
+        if not os.path.isdir(os.path.join(folder, ".git")):
+            messagebox.showerror(
+                "Not a Git repository",
+                "The selected folder is not a Git repository."
+            )
+            return None
+
+        return folder
 
     def clone_repository(self):
         url = self.url_entry.get().strip()
@@ -1615,10 +1688,21 @@ print(response.decode("utf-8"), end="")
         if not self.run_git(["init"], cwd=folder):
             return
 
-        if not self.run_git(
-            ["remote", "add", "origin", url],
-            cwd=folder
-        ):
+        # remote add fails when a previous attempt got halfway,
+        # which made the whole step impossible to retry.
+        # set-url keeps it repeatable.
+        _, remotes = self.git_run(["remote"], cwd=folder)
+
+        if "origin" in remotes.split():
+            remote_command = [
+                "remote", "set-url", "origin", url
+            ]
+        else:
+            remote_command = [
+                "remote", "add", "origin", url
+            ]
+
+        if not self.run_git(remote_command, cwd=folder):
             return
 
         if not self.run_git(
@@ -1634,10 +1718,17 @@ print(response.decode("utf-8"), end="")
             use_token=True
         )
 
-        remote_branches = self.git_output(
+        ok, remote_branches = self.git_run(
             ["branch", "-r"],
             cwd=folder
         )
+
+        if not ok:
+            self.write_log(
+                "Could not list the remote branches.",
+                "error"
+            )
+            return
 
         if not remote_branches.strip():
             self.write_log(
@@ -1685,45 +1776,407 @@ print(response.decode("utf-8"), end="")
             return
 
         self.write_url_file(Path(folder), url)
+        self.set_folder(folder)
         self.write_log(
             f"Connected. Tracking origin/{branch}.",
             "success"
         )
 
     def fetch_repository(self):
-        folder = self.get_folder()
+        folder = self.require_repository()
 
         if not folder:
             return
 
-        if not os.path.isdir(
-            os.path.join(folder, ".git")
-        ):
-            messagebox.showerror(
-                "Not a Git repo",
-                "The selected folder is not a Git repository."
-            )
-            return
-
+        # --prune drops remote tracking branches that no longer
+        # exist on the server, so renamed or deleted branches do
+        # not linger in the local branch list.
         self.run_git(
-            ["fetch", "origin"],
+            ["fetch", "--prune", "origin"],
             cwd=folder,
             use_token=True
         )
 
-    def commit_changes(self):
-        folder = self.get_folder()
+    # --------------------------------------------------------
+    # Make the checked out branch the main branch
+    # --------------------------------------------------------
+
+    def current_branch(self, folder):
+        """Name of the checked out branch, None on a detached HEAD."""
+        ok, branch = self.git_run(
+            ["symbolic-ref", "--short", "HEAD"],
+            cwd=folder,
+            log_errors=False
+        )
+
+        if not ok:
+            return None
+
+        return branch.strip() or None
+
+    def branch_exists(self, folder, name):
+        """True when the local branch refs/heads/<name> exists."""
+        ok, _ = self.git_run(
+            [
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{name}",
+            ],
+            cwd=folder,
+            log_errors=False
+        )
+
+        return ok
+
+    def remote_branch_exists(self, folder, name):
+        """True when the tracking branch origin/<name> exists."""
+        ok, _ = self.git_run(
+            [
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/remotes/origin/{name}",
+            ],
+            cwd=folder,
+            log_errors=False
+        )
+
+        return ok
+
+    def remote_exists(self, folder, name="origin"):
+        ok, remotes = self.git_run(
+            ["remote"],
+            cwd=folder,
+            log_errors=False
+        )
+
+        return ok and name in remotes.split()
+
+    def pick_old_name(self, folder, has_origin, avoid=None):
+        """
+        Pick the name that keeps the previous main branch.
+
+        Returns (name, overwrite); name is None when cancelled.
+        "avoid" is the branch that is becoming main, which must
+        keep its own name until the rename happens.
+        """
+        if OLD_BRANCH != avoid:
+            taken_local = self.branch_exists(folder, OLD_BRANCH)
+            taken_remote = has_origin and self.remote_branch_exists(
+                folder, OLD_BRANCH
+            )
+
+            if not taken_local and not taken_remote:
+                return OLD_BRANCH, False
+
+            where = (
+                "locally and on origin"
+                if taken_local and taken_remote
+                else "on origin"
+                if taken_remote
+                else "locally"
+            )
+
+            overwrite = messagebox.askyesno(
+                f"'{OLD_BRANCH}' already exists",
+                f"A branch named '{OLD_BRANCH}' already exists "
+                f"{where}.\n\n"
+                "Replace it with the previous main?\n\n"
+                "Yes: overwrite it, its current commits are lost.\n"
+                "No: keep it and use the next free name."
+            )
+
+            if overwrite:
+                return OLD_BRANCH, True
+
+        for index in range(2, 100):
+            candidate = f"{OLD_BRANCH}-{index}"
+
+            if candidate == avoid:
+                continue
+
+            if self.branch_exists(folder, candidate):
+                continue
+
+            if has_origin and self.remote_branch_exists(
+                folder, candidate
+            ):
+                continue
+
+            self.write_log(
+                f"'{OLD_BRANCH}' is taken, using "
+                f"'{candidate}' instead.",
+                "warning"
+            )
+            return candidate, False
+
+        messagebox.showerror(
+            "No free name",
+            f"Every name from '{OLD_BRANCH}' to "
+            f"'{OLD_BRANCH}-99' is taken. Rename or delete one of "
+            "them first."
+        )
+
+        return None, False
+
+    def make_head_main(self):
+        """
+        Make the checked out branch the main branch and keep the
+        previous main as "old".
+
+        Typical use: work continued on a side branch and that branch
+        should become the main line of development.
+
+        Local:  main -> old, <checked out branch> -> main
+        Origin: main is force pushed with a lease, old is pushed so
+                that no commit of the previous main is lost.
+        """
+        folder = self.require_repository()
 
         if not folder:
             return
 
-        if not os.path.isdir(
-            os.path.join(folder, ".git")
-        ):
+        branch = self.current_branch(folder)
+
+        if not branch:
             messagebox.showerror(
-                "Not a Git repository",
-                "The selected folder is not a Git repository."
+                "Detached HEAD",
+                "No branch is checked out (detached HEAD).\n\n"
+                "Check out the branch that should become "
+                f"'{MAIN_BRANCH}', then try again."
             )
+            return
+
+        if branch == MAIN_BRANCH:
+            messagebox.showinfo(
+                "Already main",
+                f"The checked out branch is already '{MAIN_BRANCH}'."
+            )
+            return
+
+        has_origin = self.remote_exists(folder)
+
+        if has_origin:
+            self.write_log("Fetching origin first...", "info")
+
+            if not self.run_git(
+                ["fetch", "--prune", "origin"],
+                cwd=folder,
+                use_token=True
+            ):
+                return
+
+        local_main = self.branch_exists(folder, MAIN_BRANCH)
+        remote_main = has_origin and self.remote_branch_exists(
+            folder, MAIN_BRANCH
+        )
+        old_branch = None
+        overwrite = False
+
+        if local_main or remote_main:
+            old_branch, overwrite = self.pick_old_name(
+                folder, has_origin, avoid=branch
+            )
+
+            if not old_branch:
+                return
+
+        local_lines = []
+
+        if old_branch:
+            if local_main:
+                local_lines.append(
+                    f"  rename '{MAIN_BRANCH}' -> '{old_branch}'"
+                )
+            else:
+                local_lines.append(
+                    f"  create '{old_branch}' from "
+                    f"origin/{MAIN_BRANCH}"
+                )
+
+        local_lines.append(
+            f"  rename '{branch}' -> '{MAIN_BRANCH}'"
+        )
+
+        remote_lines = []
+
+        if not has_origin:
+            remote_lines.append(
+                "  no 'origin' remote, local rename only"
+            )
+        else:
+            if remote_main:
+                remote_lines.append(
+                    f"  push '{MAIN_BRANCH}' (force with lease)"
+                )
+            else:
+                remote_lines.append(
+                    f"  push -u origin '{MAIN_BRANCH}'"
+                )
+
+            if old_branch:
+                if overwrite and self.remote_branch_exists(
+                    folder, old_branch
+                ):
+                    remote_lines.append(
+                        f"  push '{old_branch}' (force with lease)"
+                    )
+                else:
+                    remote_lines.append(
+                        f"  push -u origin '{old_branch}'"
+                    )
+
+        proceed = messagebox.askyesno(
+            "Make HEAD main",
+            f"'{branch}' becomes '{MAIN_BRANCH}':\n\n"
+            "Local:\n"
+            + "\n".join(local_lines)
+            + "\n\nRemote (origin):\n"
+            + "\n".join(remote_lines)
+            + "\n\nThe remote main will point to this branch. "
+            "Anyone else working\non it has to reset to the new "
+            "main.\n\n"
+            "Uncommitted changes are kept as they are.\n\n"
+            "Continue?"
+        )
+
+        if not proceed:
+            self.write_log("Cancelled, nothing was changed.", "warning")
+            return
+
+        # 1. Keep the previous main reachable as "old".
+        old_taken_local = (
+            bool(old_branch)
+            and self.branch_exists(folder, old_branch)
+        )
+
+        if local_main:
+            if not self.run_git(
+                [
+                    "branch",
+                    "-M" if old_taken_local else "-m",
+                    MAIN_BRANCH,
+                    old_branch,
+                ],
+                cwd=folder
+            ):
+                return
+        elif remote_main:
+            create_old = ["branch"]
+
+            if old_taken_local:
+                create_old.append("-f")
+
+            create_old += [old_branch, f"origin/{MAIN_BRANCH}"]
+
+            if not self.run_git(create_old, cwd=folder):
+                return
+
+        # 2. The checked out branch becomes main.
+        if not self.run_git(
+            ["branch", "-m", branch, MAIN_BRANCH],
+            cwd=folder
+        ):
+            return
+
+        self.write_log(
+            f"Renamed '{branch}' to '{MAIN_BRANCH}' locally.",
+            "success"
+        )
+
+        # 3. Publish the result.
+        if has_origin:
+            main_remote_sha = ""
+
+            if remote_main:
+                _, main_remote_sha = self.git_run(
+                    ["rev-parse", f"origin/{MAIN_BRANCH}"],
+                    cwd=folder
+                )
+
+                main_remote_sha = main_remote_sha.strip()
+
+            push_main = ["push", "-u"]
+
+            if main_remote_sha:
+                # Refuses to run when the server moved since the
+                # fetch above, so a concurrent push is not lost.
+                push_main.append(
+                    f"--force-with-lease={MAIN_BRANCH}:"
+                    f"{main_remote_sha}"
+                )
+
+            if not self.run_git(
+                push_main + ["origin", MAIN_BRANCH],
+                cwd=folder,
+                use_token=True
+            ):
+                self.write_log(
+                    "The remote main was not updated. The "
+                    "branches are renamed locally; fix the "
+                    "problem above and push "
+                    f"'{MAIN_BRANCH}' again.",
+                    "warning"
+                )
+                return
+
+            if old_branch:
+                push_old = ["push", "-u"]
+
+                if self.remote_branch_exists(folder, old_branch):
+                    ok, old_sha = self.git_run(
+                        ["rev-parse", f"origin/{old_branch}"],
+                        cwd=folder
+                    )
+
+                    old_sha = old_sha.strip()
+
+                    if ok and old_sha:
+                        push_old.append(
+                            f"--force-with-lease={old_branch}:"
+                            f"{old_sha}"
+                        )
+
+                self.run_git(
+                    push_old + ["origin", old_branch],
+                    cwd=folder,
+                    use_token=True
+                )
+        else:
+            # The rename carried the upstream of the old branch over
+            # to main; without a remote it points at nothing useful.
+            self.git_run(
+                ["branch", "--unset-upstream", MAIN_BRANCH],
+                cwd=folder,
+                log_errors=False
+            )
+
+        message = f"'{branch}' is now '{MAIN_BRANCH}'."
+
+        if old_branch:
+            message += (
+                f" The previous main is kept as '{old_branch}'."
+            )
+
+        self.write_log(message, "success")
+
+        _, branches = self.git_run(
+            ["branch", "-vv"],
+            cwd=folder,
+            log_errors=False
+        )
+
+        if branches.strip():
+            self.write_log(
+                "Branches now:\n" + branches.rstrip(),
+                "info"
+            )
+
+    def commit_changes(self):
+        folder = self.require_repository()
+
+        if not folder:
             return
 
         commit_message = self.commit_entry.get().strip()
@@ -1770,26 +2223,20 @@ print(response.decode("utf-8"), end="")
         )
 
     def push_changes(self):
-        folder = self.get_folder()
+        folder = self.require_repository()
 
         if not folder:
             return
 
-        if not os.path.isdir(
-            os.path.join(folder, ".git")
-        ):
-            messagebox.showerror(
-                "Not a Git repository",
-                "The selected folder is not a Git repository."
-            )
-            return
-
         # A folder that was connected (not cloned) has no upstream
         # on the first push; -u origin HEAD creates it.
-        has_upstream = self.git_output(
+        # The query fails on a branch without upstream, which is
+        # the answer being asked for, so it stays out of the log.
+        has_upstream, _ = self.git_run(
             ["rev-parse", "--abbrev-ref", "@{u}"],
-            cwd=folder
-        ).strip()
+            cwd=folder,
+            log_errors=False
+        )
 
         push_args = ["push"]
 
