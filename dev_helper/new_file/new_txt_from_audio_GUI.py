@@ -2167,6 +2167,16 @@ class AudioTextGUI:
             messagebox.showinfo("No audio selected", "Select an audio file first.")
             return
 
+        if self.dirty:
+            answer = messagebox.askyesnocancel(
+                "Unsaved text",
+                "Save the current text before running the transcriber?",
+            )
+            if answer is None:
+                return
+            if answer and not self.save_text():
+                return
+
         script = Path(self.transcriber_script)
         if not script.exists():
             if not messagebox.askyesno(

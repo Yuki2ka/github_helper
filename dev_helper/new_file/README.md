@@ -223,6 +223,8 @@ Keyboard shortcuts: `Ctrl+O` open folder, `Ctrl+S` save text,
 
 * Playback seeks by restarting the process on the subprocess backends, so
   seeking is a little slower than with pygame, and `afplay` cannot seek.
+* pygame seeking inside long MP3 files decodes from the start, so a seek
+  can take a moment and may be approximate.
 * Without mutagen/ffprobe/pygame the duration can be unknown; the progress
   slider and **Auto-estimate** are then disabled, but manual marks and
   imported timings still work.
