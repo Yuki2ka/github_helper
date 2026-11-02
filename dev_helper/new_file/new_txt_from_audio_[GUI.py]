@@ -1,0 +1,1198 @@
+'''
+new_txt_from_audio_[GUI.py]
+
+Portable Tkinter GUI for reading a transcript while listening to the
+matching audio file.
+
+Purpose
+-------
+Open an audio file and a matching transcript, play the audio, and keep
+the text synchronized with playback:
+
+* the line currently being heard is highlighted and scrolled into view
+  as the audio plays (auto-sync)
+* Ctrl+click or double-click any line seeks the audio to that line's
+  timestamp, computed from the exact parsed time (not a rough estimate)
+* search highlights every match and jumps between matches; jumping also
+  seeks the audio to the matched line
+* the transcript can be saved as plain text or exported as LRC
+
+Supported file types (the same set the console script supports)
+---------------------------------------------------------------
+Audio: WAV, MP3, FLAC, OGG, OPUS, M4A/AAC, WMA
+Text:  TXT, LRC ([mm:ss.ms]), SRT, JSON segments, plain MD/TXT
+
+Audio playback uses pygame (optional). When it is not installed the app
+still opens, parses and searches transcripts; it offers to install
+pygame into the ./libs folder beside this script so the whole folder
+stays portable (nothing is ever installed into the operating system).
+
+Optional: tkinterdnd2 enables dropping audio/text files onto the window.
+
+Layout beside this script:
+  libs/               optional pip packages (pygame, tkinterdnd2)
+'''
+
+import importlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Keep bytecode caches out of the portable application folder.
+sys.dont_write_bytecode = True
+
+APP_DIR = Path(__file__).resolve().parent
+LIBS_DIR = APP_DIR / "libs"
+if str(LIBS_DIR) not in sys.path:
+    sys.path.insert(0, str(LIBS_DIR))
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    from tkinter.scrolledtext import ScrolledText
+except ImportError as error:  # pragma: no cover - GUI requires Tkinter
+    sys.stderr.write(f"This GUI requires Tkinter: {error}\n")
+    raise
+
+# ---------------------------------------------------------------------------
+# User configuration
+# ---------------------------------------------------------------------------
+
+APP_TITLE = "Text from Audio"
+DEFAULT_FONT = ("Segoe UI", 11)
+LOG_HEIGHT = 4
+
+# Every file type the console version supports is listed in the open
+# dialogs of this GUI (this fixes the "missing file types" bug).
+AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wma")
+TEXT_EXTENSIONS = (".txt", ".lrc", ".srt", ".json", ".md")
+
+OPTIONAL_PACKAGES = ["pygame", "tkinterdnd2"]
+
+# Timestamp regular expressions.
+LRC_RE = re.compile(r"^\[(\d{1,3}):(\d{2})(?:\.(\d{1,3}))?\]\s*(.*)$")
+SRT_TIME_RE = re.compile(r"(\d{1,3}):(\d{2}):(\d{2})[.,](\d{1,3})")
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def fmt_time(seconds):
+    """Format seconds as mm:ss.cs (or hh:mm:ss.cs when over an hour).
+
+    Works on whole milliseconds so the hundredths digit never rolls over to 100.
+    """
+    seconds = max(0.0, float(seconds))
+    total_ms = int(round(seconds * 1000))
+    hours, remainder = divmod(total_ms, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    secs, ms = divmod(remainder, 1000)
+    hundredths = ms // 10
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}.{hundredths:02d}"
+    return f"{minutes:02d}:{secs:02d}.{hundredths:02d}"
+
+
+def parse_time_part(h, m, s, ms):
+    # ms is a string from the regex groups; str() keeps it safe for other callers.
+    return int(h) * 3600 + int(m) * 60 + int(s) + (int(ms) / 10 ** len(str(ms)) if ms else 0.0)
+
+
+def audio_filetypes():
+    """Filetypes for audio open dialogs - all supported types included."""
+    exts = " ".join(f"*{ext}" for ext in AUDIO_EXTENSIONS)
+    return [
+        ("All supported files", f"*.txt *.lrc *.srt *.json *.md {exts}"),
+        ("Audio files", exts),
+        ("WAV audio", "*.wav"),
+        ("MP3 audio", "*.mp3"),
+        ("FLAC audio", "*.flac"),
+        ("OGG audio", "*.ogg"),
+        ("OPUS audio", "*.opus"),
+        ("M4A / AAC audio", "*.m4a *.aac"),
+        ("WMA audio", "*.wma"),
+        ("All files", "*.*"),
+    ]
+
+
+def text_filetypes():
+    """Filetypes for transcript open/save dialogs."""
+    exts = " ".join(f"*{ext}" for ext in TEXT_EXTENSIONS)
+    return [
+        ("Transcript / text files", exts),
+        ("LRC lyrics", "*.lrc"),
+        ("SubRip subtitles", "*.srt"),
+        ("JSON transcript", "*.json"),
+        ("Plain text", "*.txt *.md"),
+        ("All files", "*.*"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Transcript parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_lrc(lines):
+    entries = []
+    for line in lines:
+        match = LRC_RE.match(line.strip("\n"))
+        if not match:
+            continue
+        mm, ss, ms, text = match.groups()
+        entries.append({
+            "start": parse_time_part(0, mm, ss, ms),
+            "end": None,
+            "text": text,
+        })
+    return entries
+
+
+def _parse_srt(lines):
+    entries = []
+    index = 0
+    while index < len(lines):
+        match = SRT_TIME_RE.search(lines[index])
+        if not match and "-->" not in lines[index]:
+            index += 1
+            continue
+        if not match:
+            index += 1
+            continue
+        parts = lines[index].split("-->")
+        start = parse_time_part(*SRT_TIME_RE.search(parts[0]).groups())
+        end_match = SRT_TIME_RE.search(parts[1])
+        end = parse_time_part(*end_match.groups()) if end_match else None
+        collected = []
+        index += 1
+        while index < len(lines) and lines[index].strip():
+            collected.append(lines[index])
+            index += 1
+        entries.append({
+            "start": start,
+            "end": end,
+            "text": " ".join(collected).strip(),
+        })
+    return entries
+
+
+def _parse_json(data):
+    if isinstance(data, dict):
+        segments = data.get("segments", data if isinstance(data, list) else [])
+    elif isinstance(data, list):
+        segments = data
+    else:
+        segments = []
+    entries = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        start = segment.get("start", segment.get("t", segment.get("begin", 0)))
+        text = segment.get("text", segment.get("txt", segment.get("content", "")))
+        end = segment.get("end", segment.get("to", segment.get("end")))
+        entries.append({
+            "start": float(start or 0),
+            "end": float(end) if end is not None else None,
+            "text": str(text),
+        })
+    return entries
+
+
+def parse_transcript(path):
+    """Parse a transcript file into a list of {start, end, text} entries.
+
+    Recognizes LRC, SRT, JSON and plain text automatically.
+    """
+    path = Path(path)
+    content = path.read_text(encoding="utf-8", errors="replace")
+    lines = content.splitlines()
+
+    first = ""
+    for line in lines:
+        if line.strip():
+            first = line
+            break
+
+    # LRC files often start with header tags ([ti:], [ar:], ...), so detect
+    # the format by any timestamped line, not only the first one.
+    if any(LRC_RE.match(line) for line in lines):
+        entries = _parse_lrc(lines)
+    elif "-->" in content and SRT_TIME_RE.search(content):
+        entries = _parse_srt(lines)
+    elif path.suffix.lower() == ".json" or content.lstrip().startswith(("{", "[")):
+        entries = _parse_json(json.loads(content))
+    else:
+        entries = [{"start": 0.0, "end": None, "text": content}]
+
+    entries = [e for e in entries if str(e.get("text", "")).strip() or e["start"] > 0]
+    entries.sort(key=lambda e: e["start"])
+    if not entries:
+        entries = [{"start": 0.0, "end": None, "text": content}]
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Audio playback (optional pygame backend)
+# ---------------------------------------------------------------------------
+
+
+class AudioPlayer:
+    """Very small wrapper around pygame.mixer music playback.
+
+    All methods are safe to call when no backend is available; they
+    simply do nothing and report False / zero values.
+    """
+
+    def __init__(self, log):
+        self.log = log
+        self.backend = None
+        self._pg = None
+        self.path = None
+        self.duration = 0.0
+        self._offset = 0.0
+        self._play_start = 0.0
+        self._playing = False
+        self._paused = False
+        self._paused_pos = 0.0
+
+    def available(self):
+        return self.backend == "pygame"
+
+    def init_backend(self):
+        """Import and initialize pygame.mixer. Returns True on success."""
+        if self.available():
+            return True
+        try:
+            import pygame as pg
+        except Exception as error:
+            self.log(f"pygame is not installed: {error}")
+            return False
+        try:
+            pg.mixer.init()
+        except Exception as error:
+            self.log(f"pygame mixer init failed: {error}")
+            try:
+                pg.init()
+                pg.mixer.init()
+            except Exception as error2:
+                self.log(f"pygame mixer could not start: {error2}")
+                return False
+        self._pg = pg
+        self.backend = "pygame"
+        self.log("Audio backend ready: pygame")
+        return True
+
+    def load(self, path):
+        """Load an audio file. Returns True on success."""
+        self.stop()
+        self.path = Path(path)
+        if not self.available():
+            self.log("No audio backend - file opened without playback")
+            return True
+        try:
+            sound = self._pg.mixer.Sound(str(self.path))
+            self.duration = float(sound.get_length() or 0.0)
+        except Exception as error:
+            self.duration = 0.0
+            self.log(f"Could not read audio duration: {error}")
+        try:
+            self._pg.mixer.music.load(str(self.path))
+        except Exception as error:
+            self.log(f"Failed to load audio: {error}")
+            return False
+        self.log(f"Loaded audio: {self.path.name} ({fmt_time(self.duration)})")
+        return True
+
+    def _current_position(self):
+        if self._paused:
+            return self._paused_pos
+        if self._playing and self._pg is not None:
+            pos_ms = self._pg.mixer.music.get_pos()
+            if pos_ms < 0:
+                # Music reached the end of the file.
+                return self.duration if self.duration else self._offset
+            return self._offset + pos_ms / 1000.0
+        return 0.0
+
+    def play(self, start=0.0):
+        if not self.available():
+            return False
+        start = max(0.0, float(start))
+        self._pg.mixer.music.play(loops=0, start=start)
+        self._offset = start
+        self._play_start = time.monotonic()
+        self._playing = True
+        self._paused = False
+        return True
+
+    def pause(self):
+        if self._playing and not self._paused and self._pg is not None:
+            self._paused_pos = self._current_position()
+            self._pg.mixer.music.pause()
+            self._playing = False
+            self._paused = True
+
+    def resume(self):
+        if self._paused and self._pg is not None:
+            self._pg.mixer.music.unpause()
+            self._play_start = time.monotonic()
+            self._playing = True
+            self._paused = False
+
+    def stop(self):
+        if self._pg is not None:
+            try:
+                self._pg.mixer.music.stop()
+            except Exception:
+                pass
+        self._playing = False
+        self._paused = False
+        self._offset = 0.0
+        self._play_start = 0.0
+        self._paused_pos = 0.0
+
+    def seek(self, seconds):
+        seconds = max(0.0, float(seconds))
+        if self.duration and seconds > self.duration:
+            seconds = self.duration
+        self._offset = seconds
+        if self._playing and self._pg is not None:
+            self._pg.mixer.music.play(loops=0, start=seconds)
+            self._play_start = time.monotonic()
+        return seconds
+
+    def set_volume(self, volume):
+        if self._pg is not None:
+            try:
+                self._pg.mixer.music.set_volume(max(0.0, min(1.0, float(volume))))
+            except Exception:
+                pass
+
+    def is_playing(self):
+        return self._playing
+
+    def position(self):
+        return self._current_position()
+
+
+# ---------------------------------------------------------------------------
+# Pip helper for optional portable dependencies
+# ---------------------------------------------------------------------------
+
+
+def pip_install(packages, log):
+    """Install packages into ./libs beside the script (portable)."""
+    LIBS_DIR.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable, "-m", "pip", "install", "--no-compile",
+        "--quiet", "--target", str(LIBS_DIR),
+    ] + list(packages)
+    log("Installing " + ", ".join(packages) + " into ./libs ...")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+    except Exception as error:
+        return False, str(error)
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0:
+        log(output[-2000:])
+        return False, output
+    log("Installation finished.")
+    return True, output
+
+
+# ---------------------------------------------------------------------------
+# Application
+# ---------------------------------------------------------------------------
+
+
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.minsize(700, 460)
+
+        self.player = AudioPlayer(self.log)
+        self.entries = []            # list of {start, end, text}
+        self.audio_path = None
+        self.text_path = None
+        self.current_line = -1       # highlighted transcript line (0-based)
+        self.matches = []            # search match text indices
+        self.match_pos = -1
+        self._after_id = None
+        self._seeking = False        # user is dragging the seek scale
+        self._ignore_modified = False
+        self.dark = False
+        self.last_dir = str(APP_DIR)
+
+        self._build_ui()
+        self._bind_shortcuts()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._tick()
+        self.log(f"{APP_TITLE} ready. Open an audio file and a transcript.")
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _build_ui(self):
+        root = self.root
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=1)
+
+        self._build_menu()
+        self._build_toolbar()
+        self._build_text_area()
+        self._build_controls()
+        self._build_log()
+        self._build_status()
+
+    def _build_menu(self):
+        menu = tk.Menu(self.root)
+
+        file_menu = tk.Menu(menu, tearoff=False)
+        file_menu.add_command(label="Open audio...", accelerator="Ctrl+O",
+                              command=self._open_audio)
+        file_menu.add_command(label="Open transcript...", accelerator="Ctrl+T",
+                              command=self._open_transcript)
+        file_menu.add_separator()
+        file_menu.add_command(label="Save transcript...", accelerator="Ctrl+S",
+                              command=self._save_transcript)
+        file_menu.add_command(label="Export as LRC...", command=self._export_lrc)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self._on_close)
+        menu.add_cascade(label="File", menu=file_menu)
+
+        play_menu = tk.Menu(menu, tearoff=False)
+        play_menu.add_command(label="Play / Pause", accelerator="Space",
+                              command=self._toggle_play)
+        play_menu.add_command(label="Stop", command=self._stop)
+        play_menu.add_command(label="Reload audio", command=self._reload_audio)
+        menu.add_cascade(label="Playback", menu=play_menu)
+
+        edit_menu = tk.Menu(menu, tearoff=False)
+        edit_menu.add_command(label="Find", accelerator="Ctrl+F",
+                              command=self._focus_search)
+        edit_menu.add_command(label="Next match", accelerator="F3",
+                              command=lambda: self._jump_match(1))
+        edit_menu.add_command(label="Previous match",
+                              accelerator="Shift+F3",
+                              command=lambda: self._jump_match(-1))
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Clear search", command=self._clear_search)
+        menu.add_cascade(label="Edit", menu=edit_menu)
+
+        view_menu = tk.Menu(menu, tearoff=False)
+        view_menu.add_command(label="Dark mode", command=self._toggle_theme)
+        view_menu.add_command(label="Show log", command=self._toggle_log)
+        menu.add_cascade(label="View", menu=view_menu)
+
+        help_menu = tk.Menu(menu, tearoff=False)
+        help_menu.add_command(label="Install audio backend (pygame)...",
+                              command=self._install_backend_prompt)
+        help_menu.add_separator()
+        help_menu.add_command(label="About", command=self._show_about)
+        menu.add_cascade(label="Help", menu=help_menu)
+
+        self.root.config(menu=menu)
+
+    def _build_toolbar(self):
+        bar = ttk.Frame(self.root)
+        bar.grid(row=0, column=0, sticky="ew")
+
+        self.btn_audio = ttk.Button(bar, text="\U0001F4C2 Open audio",
+                                    command=self._open_audio)
+        self.btn_audio.pack(side=tk.LEFT, padx=4, pady=4)
+        self.btn_text = ttk.Button(bar, text="\U0001F4C4 Open transcript",
+                                   command=self._open_transcript)
+        self.btn_text.pack(side=tk.LEFT, padx=4, pady=4)
+        self.btn_play = ttk.Button(bar, text="\u25B6 Play",
+                                   command=self._toggle_play, state=tk.DISABLED)
+        self.btn_play.pack(side=tk.LEFT, padx=4, pady=4)
+        self.btn_stop = ttk.Button(bar, text="\u25A0 Stop",
+                                   command=self._stop, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.LEFT, padx=4, pady=4)
+        self.btn_save = ttk.Button(bar, text="\U0001F4BE Save transcript",
+                                   command=self._save_transcript, state=tk.DISABLED)
+        self.btn_save.pack(side=tk.LEFT, padx=4, pady=4)
+        self.btn_theme = ttk.Button(bar, text="\U0001F311 Dark mode",
+                                    command=self._toggle_theme)
+        self.btn_theme.pack(side=tk.LEFT, padx=4, pady=4)
+
+        ttk.Label(bar, text="  Volume:").pack(side=tk.LEFT, padx=(16, 2), pady=4)
+        self.volume_scale = tk.Scale(bar, from_=0, to=100, orient=tk.HORIZONTAL,
+                                     length=110, command=self._on_volume)
+        self.volume_scale.set(100)
+        self.volume_scale.pack(side=tk.LEFT, padx=2, pady=4)
+
+        self.btn_install = ttk.Button(bar, text="Install audio backend",
+                                      command=self._install_backend_prompt)
+        # shown only when no backend is available
+        if self.player.available():
+            self.btn_install.pack_forget()
+        else:
+            self.btn_install.pack(side=tk.RIGHT, padx=4, pady=4)
+
+    def _build_text_area(self):
+        container = ttk.Frame(self.root)
+        container.grid(row=1, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        self.text = tk.Text(container, wrap=tk.WORD, font=DEFAULT_FONT,
+                            padx=10, pady=8, spacing2=2, undo=True)
+        self.text.grid(row=0, column=0, sticky="nsew")
+
+        scroll = ttk.Scrollbar(container, command=self.text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.text.configure(yscrollcommand=scroll.set)
+
+        self.text.tag_configure("current", background="#fff37c", foreground="#1a1a1a")
+        self.text.tag_configure("match", background="#ffd966", foreground="#1a1a1a")
+
+        self.text.bind("<Control-Button-1>", self._on_ctrl_click)
+        self.text.bind("<Double-Button-1>", self._on_double_click)
+        self.text.bind("<Button-3>", self._on_context_menu)
+        self.text.bind("<Control-c>", self._on_copy)
+
+    def _build_controls(self):
+        frame = ttk.Frame(self.root)
+        frame.grid(row=2, column=0, sticky="ew")
+        frame.columnconfigure(2, weight=1)
+
+        ttk.Label(frame, text="Time:").grid(row=0, column=0, padx=6, pady=4)
+        self.time_var = tk.StringVar(value="00:00.00 / 00:00.00")
+        self.time_label = ttk.Label(frame, textvariable=self.time_var, anchor="w")
+        self.time_label.grid(row=0, column=1, padx=4, pady=4, sticky="w")
+
+        self.seek_scale = tk.Scale(frame, from_=0, to=1000, orient=tk.HORIZONTAL,
+                                   showvalue=False)
+        self.seek_scale.grid(row=0, column=2, padx=6, pady=4, sticky="ew")
+        self.seek_scale.bind("<B1-Motion>", self._on_seek_drag)
+        self.seek_scale.bind("<ButtonRelease-1>", self._on_seek_release)
+
+        ttk.Label(frame, text="Go to (mm:ss):").grid(row=0, column=3, padx=(14, 2), pady=4)
+        self.jump_entry = ttk.Entry(frame, width=9)
+        self.jump_entry.grid(row=0, column=4, padx=2, pady=4)
+        self.jump_entry.bind("<Return>", lambda e: self._jump_to_time())
+        ttk.Button(frame, text="Go", width=5, command=self._jump_to_time).grid(
+            row=0, column=5, padx=4, pady=4)
+
+        search_frame = ttk.Frame(frame)
+        search_frame.grid(row=0, column=6, padx=(14, 6), pady=4, sticky="e")
+        self.search_var = tk.StringVar()
+        self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=18)
+        self.search_entry.pack(side=tk.LEFT, padx=2)
+        self.search_entry.bind("<KeyRelease>", lambda e: self._do_search())
+        ttk.Button(search_frame, text="\u25B2", width=2,
+                   command=lambda: self._jump_match(1)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(search_frame, text="\u25BC", width=2,
+                   command=lambda: self._jump_match(-1)).pack(side=tk.LEFT, padx=1)
+        ttk.Button(search_frame, text="\u2716", width=2,
+                   command=self._clear_search).pack(side=tk.LEFT, padx=1)
+
+    def _build_log(self):
+        self.log_frame = ttk.Frame(self.root)
+        self.log_frame.grid(row=3, column=0, sticky="ew")
+        self.log_frame.grid_remove()
+        self.log_frame.columnconfigure(0, weight=1)
+        self.log_text = tk.Text(self.log_frame, height=LOG_HEIGHT, wrap=tk.WORD,
+                                font=("Consolas", 9), state=tk.DISABLED)
+        scroll = ttk.Scrollbar(self.log_frame, command=self.log_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.configure(yscrollcommand=scroll.set)
+
+    def _build_status(self):
+        self.status_var = tk.StringVar(value="Ready")
+        status = ttk.Label(self.root, textvariable=self.status_var, anchor="w")
+        status.grid(row=4, column=0, sticky="ew")
+
+    # ------------------------------------------------------------------
+    # Shortcuts
+    # ------------------------------------------------------------------
+    def _bind_shortcuts(self):
+        root = self.root
+        root.bind_all("<Control-o>", lambda e: (self._open_audio(), "break")[1])
+        root.bind_all("<Control-t>", lambda e: (self._open_transcript(), "break")[1])
+        root.bind_all("<Control-s>", lambda e: (self._save_transcript(), "break")[1])
+        root.bind_all("<Control-f>", lambda e: (self._focus_search(), "break")[1])
+        root.bind_all("<F3>", lambda e: (self._jump_match(1), "break")[1])
+        root.bind_all("<Shift-F3>", lambda e: (self._jump_match(-1), "break")[1])
+        root.bind_all("<Escape>", self._on_escape)
+        root.bind_all("<KeyPress-space>", self._on_space)
+        root.bind_all("<KeyPress-s>", self._on_stop_key)
+
+    def _typing_widget(self, widget):
+        return widget.winfo_class() in ("Entry", "Text")
+
+    def _on_space(self, event):
+        if self._typing_widget(event.widget):
+            return
+        self._toggle_play()
+        return "break"
+
+    def _on_stop_key(self, event):
+        if self._typing_widget(event.widget):
+            return
+        self._stop()
+        return "break"
+
+    def _on_escape(self, event):
+        if self._typing_widget(event.widget):
+            return
+        self._clear_search()
+        return "break"
+
+    def _focus_search(self):
+        self.search_entry.focus_set()
+        self.search_entry.selection_range(0, tk.END)
+
+    # ------------------------------------------------------------------
+    # Logging / status / theme
+    # ------------------------------------------------------------------
+    def log(self, message):
+        print(message)
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+        self.root.update_idletasks()
+
+    def set_status(self, message, temporary=False):
+        self.status_var.set(message)
+        if temporary:
+            self.root.after(4000, lambda: self.status_var.set("Ready"))
+
+    def _toggle_theme(self):
+        self.dark = not self.dark
+        self._apply_theme()
+        self.btn_theme.configure(text="\U0001F311 Light mode" if self.dark
+                                 else "\U0001F311 Dark mode")
+
+    def _apply_theme(self):
+        if self.dark:
+            palette = {
+                "bg": "#2d2d2d", "fg": "#e6e6e6", "insert": "#ffffff",
+                "select": "#3a6ea5", "current": "#5c4a00", "current_fg": "#ffe066",
+                "match": "#8a5a00", "match_fg": "#ffe066",
+                "toolbar": "#3a3a3a", "status": "#3a3a3a",
+            }
+        else:
+            palette = {
+                "bg": "#ffffff", "fg": "#1a1a1a", "insert": "#000000",
+                "select": "#b3d7ff", "current": "#fff37c", "current_fg": "#1a1a1a",
+                "match": "#ffd966", "match_fg": "#1a1a1a",
+                "toolbar": "#f2f2f2", "status": "#e5e5e5",
+            }
+
+        self.root.configure(bg=palette["bg"])
+        self.text.configure(bg=palette["bg"], fg=palette["fg"],
+                            insertbackground=palette["insert"],
+                            selectbackground=palette["select"])
+        self.text.tag_configure("current", background=palette["current"],
+                                foreground=palette["current_fg"])
+        self.text.tag_configure("match", background=palette["match"],
+                                foreground=palette["match_fg"])
+
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TFrame", background=palette["toolbar"])
+        style.configure("TLabel", background=palette["status"], foreground=palette["fg"])
+        style.configure("TEntry", fieldbackground=palette["bg"], foreground=palette["fg"])
+
+    def _toggle_log(self):
+        if self.log_frame.winfo_viewable():
+            self.log_frame.grid_remove()
+        else:
+            self.log_frame.grid()
+
+    # ------------------------------------------------------------------
+    # File operations
+    # ------------------------------------------------------------------
+    def _open_audio(self):
+        path = filedialog.askopenfilename(
+            title="Open audio file", initialdir=self.last_dir,
+            filetypes=audio_filetypes())
+        if not path:
+            return
+        self.last_dir = os.path.dirname(path)
+        ok = self.player.load(path)
+        if not ok:
+            messagebox.showerror(APP_TITLE, f"Could not load audio file:\n{path}")
+            return
+        self.audio_path = path
+        self.player.stop()
+        self._set_seek_limits(self.player.duration)
+        self.seek_scale.set(0)
+        self.time_var.set(f"00:00.00 / {fmt_time(self.player.duration)}")
+        self.btn_play.configure(state=tk.NORMAL)
+        self.btn_stop.configure(state=tk.NORMAL)
+        self.btn_save.configure(state=tk.NORMAL)
+        self.btn_install.pack_forget()
+        self._update_title()
+        self.set_status(f"Audio loaded: {os.path.basename(path)}")
+
+    def _open_transcript(self):
+        path = filedialog.askopenfilename(
+            title="Open transcript", initialdir=self.last_dir,
+            filetypes=text_filetypes())
+        if not path:
+            return
+        self.last_dir = os.path.dirname(path)
+        try:
+            self.entries = parse_transcript(path)
+        except Exception as error:
+            messagebox.showerror(APP_TITLE, f"Could not parse transcript:\n{error}")
+            return
+        self.text_path = path
+        self._fill_text()
+        self._clear_search()
+        self._update_title()
+        self.set_status(
+            f"Transcript loaded: {os.path.basename(path)} ({len(self.entries)} lines)")
+
+    def _fill_text(self):
+        self.text.configure(state=tk.NORMAL)
+        self.text.delete("1.0", tk.END)
+        for index, entry in enumerate(self.entries, start=1):
+            line_text = str(entry.get("text", "")).replace("\n", " ")
+            self.text.insert(f"{index}.0", line_text + "\n")
+        self.text.configure(state=tk.DISABLED)
+        self.current_line = -1
+        self.text.tag_remove("current", "1.0", tk.END)
+
+    def _save_transcript(self):
+        if not self.entries:
+            messagebox.showinfo(APP_TITLE, "No transcript to save.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save transcript", initialdir=self.last_dir,
+            defaultextension=".txt", filetypes=text_filetypes())
+        if not path:
+            return
+        self.last_dir = os.path.dirname(path)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                for entry in self.entries:
+                    handle.write(str(entry.get("text", "")) + "\n")
+            self.set_status(f"Transcript saved: {os.path.basename(path)}")
+        except Exception as error:
+            messagebox.showerror(APP_TITLE, f"Could not save transcript:\n{error}")
+
+    def _export_lrc(self):
+        if not self.entries:
+            messagebox.showinfo(APP_TITLE, "No transcript to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export LRC", initialdir=self.last_dir,
+            defaultextension=".lrc", filetypes=[("LRC lyrics", "*.lrc"),
+                                                ("All files", "*.*")])
+        if not path:
+            return
+        self.last_dir = os.path.dirname(path)
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                for entry in self.entries:
+                    handle.write(f"{fmt_time(entry['start'])} {entry['text']}\n")
+            self.set_status(f"LRC exported: {os.path.basename(path)}")
+        except Exception as error:
+            messagebox.showerror(APP_TITLE, f"Could not export LRC:\n{error}")
+
+    def _reload_audio(self):
+        if not self.audio_path:
+            return
+        self._open_audio_file(self.audio_path)
+
+    def _open_audio_file(self, path):
+        ok = self.player.load(path)
+        if ok:
+            self.audio_path = path
+            self._set_seek_limits(self.player.duration)
+            self.seek_scale.set(0)
+            self.time_var.set(f"00:00.00 / {fmt_time(self.player.duration)}")
+            self.btn_play.configure(state=tk.NORMAL)
+            self.btn_stop.configure(state=tk.NORMAL)
+            self.btn_save.configure(state=tk.NORMAL)
+            self._update_title()
+
+    def _set_seek_limits(self, duration):
+        top = max(duration, 1.0)
+        self.seek_scale.configure(from_=0, to=top, resolution=0.1)
+
+    # ------------------------------------------------------------------
+    # Playback
+    # ------------------------------------------------------------------
+    def _toggle_play(self):
+        if not self.audio_path:
+            messagebox.showinfo(APP_TITLE, "Open an audio file first.")
+            return
+        if not self.player.available():
+            if not self._install_backend_prompt():
+                return
+            if not self.player.available():
+                messagebox.showerror(APP_TITLE, "Audio backend unavailable.")
+                return
+        if self.player.is_playing():
+            self.player.pause()
+            self.btn_play.configure(text="\u25B6 Play")
+        elif self.player._paused:
+            self.player.resume()
+            self.btn_play.configure(text="\u23F8 Pause")
+        else:
+            start = float(self.seek_scale.get() or 0)
+            self.player.play(start=start)
+            self.btn_play.configure(text="\u23F8 Pause")
+        self.btn_stop.configure(state=tk.NORMAL)
+
+    def _stop(self):
+        self.player.stop()
+        self.btn_play.configure(text="\u25B6 Play")
+        self.btn_stop.configure(state=tk.DISABLED)
+        self.seek_scale.set(0)
+        self.time_var.set(f"00:00.00 / {fmt_time(self.player.duration)}")
+        self.text.tag_remove("current", "1.0", tk.END)
+        self.current_line = -1
+
+    def _tick(self):
+        self._after_id = self.root.after(200, self._tick)
+        if not self.player.is_playing():
+            return
+        pos = self.player.position()
+        if self.player.duration and pos >= self.player.duration - 0.3:
+            self._stop()
+            self.time_var.set(f"{fmt_time(self.player.duration)} / "
+                              f"{fmt_time(self.player.duration)}")
+            return
+        self._sync_to_position(pos)
+        if not self._seeking:
+            self.seek_scale.set(pos)
+        self.time_var.set(f"{fmt_time(pos)} / {fmt_time(self.player.duration)}")
+
+    def _sync_to_position(self, pos):
+        target = -1
+        for index, entry in enumerate(self.entries):
+            if entry["start"] <= pos + 0.05:
+                target = index
+            else:
+                break
+        if target < 0 or target == self.current_line:
+            return
+        self.text.tag_remove("current", "1.0", tk.END)
+        self.current_line = target
+        start_index = f"{target + 1}.0"
+        if target + 1 < len(self.entries):
+            end_index = f"{target + 2}.0"
+        else:
+            end_index = tk.END
+        self.text.tag_add("current", start_index, end_index)
+        self.text.see(start_index)
+
+    def _seek_to(self, seconds, highlight_line=None):
+        seconds = self.player.seek(seconds)
+        self.seek_scale.set(seconds)
+        self.time_var.set(f"{fmt_time(seconds)} / {fmt_time(self.player.duration)}")
+        self.set_status(f"Seeked to {fmt_time(seconds)}")
+        if highlight_line is not None:
+            self._set_highlight_line(highlight_line - 1)
+        elif self.entries:
+            self._sync_to_position(seconds)
+
+    def _set_highlight_line(self, line):
+        if line == self.current_line:
+            return
+        self.text.tag_remove("current", "1.0", tk.END)
+        self.current_line = line
+        if line >= 0:
+            start_index = f"{line + 1}.0"
+            if line + 1 < len(self.entries):
+                end_index = f"{line + 2}.0"
+            else:
+                end_index = tk.END
+            self.text.tag_add("current", start_index, end_index)
+            self.text.see(start_index)
+
+    def _current_seek_seconds(self):
+        try:
+            return float(self.seek_scale.get() or 0)
+        except tk.TclError:
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # Text interaction: ctrl-click / double-click / context menu
+    # ------------------------------------------------------------------
+    def _line_at(self, x, y):
+        try:
+            index = self.text.index(f"@{x},{y}")
+        except tk.TclError:
+            return -1
+        try:
+            return int(str(index).split(".")[0]) - 1
+        except (ValueError, IndexError):
+            return -1
+
+    def _on_ctrl_click(self, event):
+        line = self._line_at(event.x, event.y)
+        if line < 0 or line >= len(self.entries):
+            return
+        seconds = self.entries[line]["start"]
+        self._seek_to(seconds, highlight_line=line + 1)
+        return "break"
+
+    def _on_double_click(self, event):
+        line = self._line_at(event.x, event.y)
+        if line < 0 or line >= len(self.entries):
+            return
+        seconds = self.entries[line]["start"]
+        self._seek_to(seconds, highlight_line=line + 1)
+        return "break"
+
+    def _on_context_menu(self, event):
+        line = self._line_at(event.x, event.y)
+        menu = tk.Menu(self.root, tearoff=False)
+        if 0 <= line < len(self.entries):
+            seconds = self.entries[line]["start"]
+            menu.add_command(
+                label=f"Seek to line {line + 1} ({fmt_time(seconds)})",
+                command=lambda: self._seek_to(seconds, highlight_line=line + 1))
+            menu.add_command(
+                label="Copy line",
+                command=lambda: self._copy_text(self.entries[line]["text"]))
+        menu.add_separator()
+        menu.add_command(label="Copy transcript",
+                         command=lambda: self._copy_text("\n".join(
+                             str(e.get("text", "")) for e in self.entries)))
+        menu.add_command(label="Clear highlighting",
+                         command=lambda: self.text.tag_remove("sel", "1.0", tk.END))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _on_copy(self, event):
+        try:
+            selection = self.text.selection_get()
+        except tk.TclError:
+            selection = None
+        if selection:
+            self._copy_text(selection)
+        else:
+            self._copy_text("\n".join(str(e.get("text", "")) for e in self.entries))
+        return "break"
+
+    def _copy_text(self, text_value):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text_value)
+        self.set_status("Copied to clipboard")
+
+    # ------------------------------------------------------------------
+    # Seek scale / jump to time
+    # ------------------------------------------------------------------
+    def _on_seek_drag(self, event):
+        self._seeking = True
+        try:
+            value = float(self.seek_scale.get())
+        except tk.TclError:
+            return
+        total = self.player.duration or 0.0
+        self.time_var.set(f"{fmt_time(value)} / {fmt_time(total)}")
+
+    def _on_seek_release(self, event):
+        self._seeking = False
+        try:
+            value = float(self.seek_scale.get())
+        except tk.TclError:
+            return
+        if self.audio_path and not self.player.available():
+            self.set_status(f"Position {fmt_time(value)} (no audio backend)")
+            return
+        self._seek_to(value)
+
+    def _on_volume(self, value):
+        self.player.set_volume(float(value) / 100.0)
+
+    def _jump_to_time(self):
+        text_value = self.jump_entry.get().strip()
+        if not text_value:
+            return
+        match = re.fullmatch(r"(\d+):(\d{2})(?:\.(\d{1,3}))?", text_value)
+        if not match:
+            messagebox.showerror(APP_TITLE, "Use mm:ss or mm:ss.cs")
+            return
+        seconds = parse_time_part(*match.groups())
+        self._seek_to(seconds)
+        self.jump_entry.focus_set()
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+    def _do_search(self):
+        term = self.search_var.get()
+        self.text.tag_remove("match", "1.0", tk.END)
+        self.text.tag_remove("sel", "1.0", tk.END)
+        self.matches = []
+        self.match_pos = -1
+        if not term:
+            self.set_status("Search cleared")
+            return
+        start = "1.0"
+        while True:
+            index = self.text.search(term, start, stopindex=tk.END, nocase=True)
+            if not index:
+                break
+            end = f"{index}+{len(term)}c"
+            self.text.tag_add("match", index, end)
+            self.matches.append(index)
+            start = end
+        self.set_status(f"{len(self.matches)} match(es) found")
+        if self.matches:
+            self._jump_match(0)
+
+    def _jump_match(self, direction):
+        if not self.matches:
+            return
+        self.match_pos = (self.match_pos + direction) % len(self.matches)
+        index = self.matches[self.match_pos]
+        term = self.search_var.get()
+        end = f"{index}+{len(term)}c"
+        self.text.see(index)
+        self.text.mark_set("insert", index)
+        self.text.tag_add("sel", index, end)
+        line = int(str(index).split(".")[0]) - 1
+        if 0 <= line < len(self.entries):
+            self._seek_to(self.entries[line]["start"], highlight_line=line + 1)
+
+    def _clear_search(self):
+        self.text.tag_remove("match", "1.0", tk.END)
+        self.text.tag_remove("sel", "1.0", tk.END)
+        self.matches = []
+        self.match_pos = -1
+        self.search_var.set("")
+        self.search_entry.focus_set()
+        self.set_status("Search cleared")
+
+    # ------------------------------------------------------------------
+    # Audio backend installation (optional, portable)
+    # ------------------------------------------------------------------
+    def _install_backend_prompt(self):
+        if self.player.available():
+            return True
+        answer = messagebox.askyesno(
+            APP_TITLE,
+            "pygame is not installed, so audio playback is unavailable.\n\n"
+            "Install it into the ./libs folder beside this script?\n"
+            "(Requires an internet connection; nothing is installed "
+            "into the operating system.)")
+        if not answer:
+            return False
+        ok, _ = pip_install(OPTIONAL_PACKAGES[:1], self.log)
+        if ok:
+            importlib.invalidate_caches()
+            if self.player.init_backend():
+                self.btn_install.pack_forget()
+                self.btn_play.configure(state=tk.NORMAL if self.audio_path
+                                        else tk.DISABLED)
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Misc
+    # ------------------------------------------------------------------
+    def _update_title(self):
+        parts = [APP_TITLE]
+        if self.audio_path:
+            parts.append(os.path.basename(self.audio_path))
+        if self.text_path:
+            parts.append("|")
+            parts.append(os.path.basename(self.text_path))
+        self.root.title(" ".join(parts))
+
+    def _show_about(self):
+        backend = "pygame" if self.player.available() else "none (read-only)"
+        messagebox.showinfo(
+            APP_TITLE,
+            f"{APP_TITLE}\n"
+            f"Portable Tkinter helper for synced transcript playback.\n\n"
+            f"Audio backend: {backend}\n"
+            f"Supported audio: {', '.join(AUDIO_EXTENSIONS)}\n"
+            f"Supported text: {', '.join(TEXT_EXTENSIONS)}\n\n"
+            f"Folder: {APP_DIR}")
+
+    def _on_close(self):
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+        self.player.stop()
+        self.root.destroy()
+
+
+def main():
+    try:
+        from tkinterdnd2 import Tk as DnDTk
+        root = DnDTk()
+    except Exception:
+        root = tk.Tk()
+
+    app = App(root)
+
+    # Optional drag & drop of audio/text files onto the window.
+    try:
+        from tkinterdnd2 import DND_FILES
+        def _on_drop(event):
+            data = event.data.strip()
+            paths = []
+            if data.startswith("{"):
+                for chunk in data[1:].split("}"):
+                    chunk = chunk.strip()
+                    if chunk:
+                        paths.append(chunk)
+            else:
+                paths = data.split()
+            for path in paths:
+                path = path.strip("{}")
+                if not os.path.exists(path):
+                    continue
+                ext = os.path.splitext(path)[1].lower()
+                if ext in AUDIO_EXTENSIONS and not app.audio_path:
+                    app._open_audio_file(path)
+                    break
+            for path in paths:
+                path = path.strip("{}")
+                if not os.path.exists(path):
+                    continue
+                ext = os.path.splitext(path)[1].lower()
+                if ext in TEXT_EXTENSIONS:
+                    app._open_transcript_file(path)
+                    break
+
+        def _open_transcript_file(path):
+            try:
+                app.entries = parse_transcript(path)
+            except Exception as error:
+                app.log(f"Dropped transcript failed to parse: {error}")
+                return
+            app.text_path = path
+            app._fill_text()
+            app._clear_search()
+            app._update_title()
+            app.set_status(f"Dropped transcript: {os.path.basename(path)}")
+
+        app._open_transcript_file = _open_transcript_file
+        root.drop_target_register(DND_FILES)
+        root.dnd_bind("<<Drop>>", _on_drop)
+    except Exception:
+        pass
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
