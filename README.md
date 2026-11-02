@@ -32,3 +32,24 @@ Git. Do not commit these files or remove their ignore rules.
 
 ## repo
 https://github.com/Yuki2ka/github_helper
+
+## Text from audio (dev_helper/new_file)
+
+Run `python dev_helper/new_file/new_txt_from_audio_GUI.py`.
+
+A small Tk workbench for audio transcripts. It lists the audio files of a
+folder on the left (a check mark means the companion `<name>.txt` already
+exists) and shows that text file in an editor on the right. Play/pause,
+`-10 s` and a progress slider work without extra packages (pygame, Windows
+MCI or ffplay/mpv/afplay are used when present). **Run
+new_txt_from_audio.py** executes the sibling transcriber for the selected
+file, or for every file that still has no text, and the new text is loaded
+automatically.
+
+For karaoke-style syncing, Ctrl+click a word while the audio plays to pin
+it to the current time; playback then highlights the current word. Marks
+can also be estimated or imported from Whisper-style JSON or SRT/VTT and
+are stored in `<name>.sync.json`. See
+[dev_helper/new_file/README.md](dev_helper/new_file/README.md) for the
+transcriber contract, supported backends and the investigation of
+automatic word alignment.

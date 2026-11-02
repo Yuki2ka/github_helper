@@ -49,3 +49,20 @@ user paste 32bit secret from github
 script encrypt it with password and save to secret.bin
 if bin present it  decrypt it using hardcoded const at start of file or fallback to ask password
 	then print generated pas key and have button to copy it to clipboard
+
+## new_txt_from_audio_GUI.py
+
+tk GUI for the audio transcription script in dev_helper/new_file
+open folder, audio list on the left (mark files that have a .txt)
+play/pause, -10s, stop, progress
+button to run new_txt_from_audio.py, show its log
+show the companion text file on the right, save text button
+reload list/text after the transcriber creates files
+
+karaoke sync:
+ctrl-click a word in the editor to pin it to the current playback time
+(current time minus a small reaction lead), ctrl-right-click removes it
+highlight the current word while playing, follow playback + auto-scroll
+auto-estimate marks by word length, import whisper json / srt / vtt
+marks saved to <audio>.sync.json so they survive restarts and text edits
+no audio backend needed for editing; pygame or system players for playback
